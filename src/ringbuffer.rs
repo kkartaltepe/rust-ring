@@ -1,22 +1,17 @@
-extern crate core;
 
-use std::sync::{Arc, Mutex};
-use std::result::Result;
-use std::cell::UnsafeCell;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
+use std::result::Result;
+use std::thread;
 
 use std::cmp::{min};
-use std::thread;
 use std::clone::Clone;
-use std::ops::Deref;
 
 use core::ptr;
-
-mod rawbuf;
-
 use rawbuf::RawBuf;
 
-struct RingBuffer<T> {
+pub struct RingBuffer<T> {
 	buf: UnsafeCell<RawBuf<T>>,
 	cap: usize,
 
@@ -80,7 +75,7 @@ where T: Clone {
 			let used = self.used();
 
 			if used < amt {
-				std::thread::yield_now();
+				thread::yield_now();
 			} else {
 				return used;
 			}
@@ -95,7 +90,7 @@ where T: Clone {
 			let free = self.cap - self.used();
 
 			if free < amt {
-				std::thread::yield_now();
+				thread::yield_now();
 			} else {
 				return free;
 			}
@@ -104,7 +99,7 @@ where T: Clone {
 
 	}
 
-	fn read_full(&self, buf: &mut Vec<T>, amt: usize) -> Result<(), String> {
+	pub fn read_full(&self, buf: &mut Vec<T>, amt: usize) -> Result<(), String> {
 		let rlock = self.rlock.lock().unwrap();
 
 		let to_read = amt;
@@ -158,59 +153,63 @@ where T: Clone {
 	}
 }
 
-const NUM_THREADS: usize = 10;
-const NUM_WRITES: usize = 100;
-const PIECES_PER_WRITE: usize = 512;
-const PIECE_SIZE: usize = 1024;
-const RING_SIZE: usize = 10;
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+	use std::ops::Deref;
+	use std::thread;
 
+	use ringbuffer::RingBuffer;
 
-fn main() {
-	let ring = Arc::new(RingBuffer::<Arc<[u8; PIECE_SIZE]>>::new(RING_SIZE));
-	let mut threads = Vec::new();
-	
-	let start = std::time::Instant::now();
-	for j in 0..NUM_THREADS {
-		let r = ring.clone();
-		let g = thread::spawn(move || {
-			for i in 0..NUM_WRITES {
-				let mut write_me = Vec::with_capacity(PIECES_PER_WRITE);
-				for k in 0..PIECES_PER_WRITE {
-					write_me.push(Arc::new([(j*4+(i%2)*2+(k%2)) as u8; PIECE_SIZE]));
-				}
-				r.write_full(write_me.as_slice()).unwrap();
-			}
-		});
-		threads.push(g);
-	}
+	#[test]
+	fn mixed_read_writes_no_interleaving() {
+		const NUM_THREADS: usize = 10;
+		const NUM_WRITES: usize = 100;
+		const PIECES_PER_WRITE: usize = 512;
+		const PIECE_SIZE: usize = 1024;
+		const RING_SIZE: usize = 10;
 
-	for _ in 0..NUM_THREADS {
-		let r = ring.clone();
-		let g = thread::spawn(move || {
-			for _ in 0..NUM_WRITES {
-				let mut read_data = Vec::with_capacity(PIECES_PER_WRITE);
-				r.read_full(&mut read_data, PIECES_PER_WRITE).unwrap();
-
-				for v in 0..read_data.len() {
-					if v > 0 {
-						assert!(read_data[v].deref()[0]%2 != read_data[v-1].deref()[0]%2)
+		let ring = Arc::new(RingBuffer::<Arc<[u8; PIECE_SIZE]>>::new(RING_SIZE));
+		let mut threads = Vec::new();
+		
+		for j in 0..NUM_THREADS {
+			let r = ring.clone();
+			let g = thread::spawn(move || {
+				for i in 0..NUM_WRITES {
+					let mut write_me = Vec::with_capacity(PIECES_PER_WRITE);
+					for k in 0..PIECES_PER_WRITE {
+						write_me.push(Arc::new([(j*4+(i%2)*2+(k%2)) as u8; PIECE_SIZE]));
 					}
-					for x in read_data[v].iter() {
-						assert!(*x == read_data[v].deref()[0]);
+					r.write_full(write_me.as_slice()).unwrap();
+				}
+			});
+			threads.push(g);
+		}
+
+		for _ in 0..NUM_THREADS {
+			let r = ring.clone();
+			let g = thread::spawn(move || {
+				for _ in 0..NUM_WRITES {
+					let mut read_data = Vec::with_capacity(PIECES_PER_WRITE);
+					r.read_full(&mut read_data, PIECES_PER_WRITE).unwrap();
+
+					for v in 0..read_data.len() {
+						if v > 0 {
+							assert!(read_data[v].deref()[0]%2 != read_data[v-1].deref()[0]%2)
+						}
+						for x in read_data[v].iter() {
+							assert!(*x == read_data[v].deref()[0]);
+						}
 					}
 				}
-			}
-		});
-		threads.push(g);
-	}
+			});
+			threads.push(g);
+		}
 
-	for t in threads {
-		t.join().unwrap();
+		// No join_try so pray this doesnt deadlock (since it shouldnt).
+		// Maybe add timer in another thread and panic or something?
+		for t in threads {
+			assert!(t.join().is_ok());
+		}
 	}
-
-	let end = std::time::Instant::now();
-	let dur = end.duration_since(start);
-	let elems = NUM_THREADS*NUM_WRITES*PIECES_PER_WRITE*PIECE_SIZE;
-	println!("{} elems took {}.{} nanos", elems, dur.as_secs(), dur.subsec_nanos());
-	println!("{} elems/s", elems as f64 /(dur.as_secs() as f64 + 0.0000000001f64*(dur.subsec_nanos() as f64)));
 }

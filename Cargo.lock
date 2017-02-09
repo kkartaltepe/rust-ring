@@ -1,0 +1,4 @@
+[root]
+name = "rust-ring"
+version = "0.1.0"
+

@@ -1,0 +1,4 @@
+[package]
+name = "rust-ring"
+version = "0.1.0"
+authors = ["Kurt Kartaltepe <kkartalepe@gmail.com>"]
