@@ -12,43 +12,12 @@ use std::ops::Deref;
 
 use core::ptr;
 
-struct RawBuf<T> {
-	ptr: *mut T,
-	size: usize,
-}
+mod rawbuf;
 
-impl<T> RawBuf<T> { //"Stable"
-	pub fn new(size: usize) -> RawBuf<T> {
-		let mut v = Vec::with_capacity(size);
-	    let ptr = v.as_mut_ptr();
-	    std::mem::forget(v);
-
-	    return RawBuf {
-	    	ptr: ptr,
-	    	size: size,
-	    }
-	}
-
-	pub fn ptr(&self) -> *mut T {
-		return self.ptr;
-	}
-
-	pub fn len(&self) -> usize {
-		return self.size;
-	}
-}
-
-impl<T> Drop for RawBuf<T> {
-	// Drops the buffer *without* dropping any of the values possibly still stored.
-	// User of this struct MUST be responsible for elements.
-	fn drop(&mut self) {
-		unsafe{ std::mem::drop(Vec::from_raw_parts(self.ptr, 0, self.size)); }
-	}
-}
+use rawbuf::RawBuf;
 
 struct RingBuffer<T> {
 	buf: UnsafeCell<RawBuf<T>>,
-	size: usize, // size of the underlying buffer
 	cap: usize,
 
 	head: AtomicUsize,
@@ -71,53 +40,13 @@ where T: Clone {
 		return RingBuffer{
 			buf: UnsafeCell::new(RawBuf::new(size)),
 			cap: capacity,
-			size: size,
 
 			head: AtomicUsize::new(0),
 			wlock: Mutex::new(()),
 			tail: AtomicUsize::new(0),
 			rlock: Mutex::new(()),
 		};
-	}
 
-	pub fn wait_used(&self, amt: usize) -> usize {
-			loop  {
-				let tail = self.tail.load(Ordering::Relaxed);
-				let head = self.head.load(Ordering::Relaxed);
-				let used = match head >= tail {
-					true => (head - tail),
-					false => ((head + self.size) - tail),
-				};
-
-				if used < amt {
-					std::thread::yield_now();
-					// drop(self.rnotify.wait(self.signal.lock().unwrap()).unwrap());
-				} else {
-					return used;
-				}
-
-			}
-
-	}
-
-	pub fn wait_free(&self, amt: usize) -> usize {
-		loop  {
-			let tail = self.tail.load(Ordering::Relaxed);
-			let head = self.head.load(Ordering::Relaxed);
-			let free = self.cap - match head >= tail {
-				true => (head - tail),
-				false => ((head + self.size) - tail),
-			};
-
-			if free < amt {
-				std::thread::yield_now();
-				// drop(self.wnotify.wait(self.signal.lock().unwrap()).unwrap());
-			} else {
-				return free;
-			}
-
-		}
-			
 	}
 
 	#[inline]
@@ -126,14 +55,58 @@ where T: Clone {
 	}
 
 	#[inline]
-    unsafe fn buf_write(&self, idx: usize, value: T) {
-        ptr::write((*self.buf.get()).ptr().offset(idx as isize), value);
-    }
+	unsafe fn buf_write(&self, idx: usize, value: T) {
+		ptr::write((*self.buf.get()).ptr().offset(idx as isize), value);
+	}
 
-	pub fn read_full(&self, buf: &mut Vec<T>, amt: usize) -> Result<(), String> {
+	#[inline]
+	fn buf_size(&self) -> usize {
+		return unsafe{ &*self.buf.get() }.len();
+	}
+
+	#[inline]
+	fn used(&self) -> usize {
+		let tail = self.tail.load(Ordering::Relaxed);
+		let head = self.head.load(Ordering::Relaxed);
+		match head >= tail {
+			true => (head - tail),
+			false => ((head + self.buf_size()) - tail),
+		}
+	}
+
+	#[inline]
+	fn wait_used(&self, amt: usize) -> usize {
+		loop {
+			let used = self.used();
+
+			if used < amt {
+				std::thread::yield_now();
+			} else {
+				return used;
+			}
+
+		}
+
+	}
+
+	#[inline]
+	fn wait_free(&self, amt: usize) -> usize {
+		loop  {
+			let free = self.cap - self.used();
+
+			if free < amt {
+				std::thread::yield_now();
+			} else {
+				return free;
+			}
+
+		}
+
+	}
+
+	fn read_full(&self, buf: &mut Vec<T>, amt: usize) -> Result<(), String> {
 		let rlock = self.rlock.lock().unwrap();
 
-		// let to_read = buf.len();
 		let to_read = amt;
 		let mut have_read = 0;
 
@@ -142,15 +115,13 @@ where T: Clone {
 			let used = self.wait_used(min(BLOCK_SIZE,to_read-have_read));
 
 			let readable = min(used, to_read-have_read);
-			// println!("Reading {}/{}", readable+have_read, to_read);
 			for i in 0..readable {
-				unsafe{ buf.push(self.buf_read((tail+i)%self.size)); }
+				unsafe{ buf.push(self.buf_read((tail+i)%self.buf_size())); }
 			}
 			have_read += readable;
 
-			tail = (tail + readable) % self.size;
+			tail = (tail + readable) % self.buf_size();
 			self.tail.store(tail, Ordering::Release);
-			// self.wnotify.notify_one();
 		}
 
 		drop(rlock);
@@ -172,15 +143,13 @@ where T: Clone {
 			let free = self.wait_free(min(BLOCK_SIZE, to_write-have_write));
 
 			let writable = min(free, to_write-have_write);
-			// println!("Writing {}/{}", writable+have_write, to_write);
 			for i in 0..writable {
-				 unsafe{ self.buf_write((head+i)%self.size, buf[have_write+i].clone()); }
+				 unsafe{ self.buf_write((head+i)%self.buf_size(), buf[have_write+i].clone()); }
 			}
 			have_write += writable;
 
-			head = (head + writable) % self.size;
+			head = (head + writable) % self.buf_size();
 			self.head.store(head, Ordering::Release);
-			// self.rnotify.notify_one();
 		}
 
 
