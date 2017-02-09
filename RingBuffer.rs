@@ -1,14 +1,15 @@
-use std::sync::{Arc, Mutex, Condvar, MutexGuard};
+use std::sync::{Arc, Mutex, Condvar};
 use std::result::Result;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::cmp::{min};
 use std::thread;
+use std::clone::Clone;
 
-#[repr(C)]
-struct RingBuffer {
-	buf: UnsafeCell<Vec<u8>>,
+struct RingBuffer<T> {
+	buf: UnsafeCell<Vec<T>>,
+	size: usize, // size of the underlying buffer
 	cap: usize,
 	signal: Mutex<()>,
 	wnotify: Condvar,
@@ -21,16 +22,20 @@ struct RingBuffer {
 
 }
 
-unsafe impl Sync for RingBuffer {}
-unsafe impl Send for RingBuffer {}
+unsafe impl<T> Sync for RingBuffer<T> {}
+unsafe impl<T> Send for RingBuffer<T> {}
 
 const BLOCK_SIZE: usize = 1;
 
-impl RingBuffer {
-	pub fn new(capacity: usize) -> RingBuffer {
-		return RingBuffer{
-			buf: UnsafeCell::new(vec![0u8; capacity+1]),
+impl<T> RingBuffer<T>
+where T: Clone {
+	pub fn new(capacity: usize) -> RingBuffer<T> {
+		let size = capacity+1;
+		
+		let rb = RingBuffer{
+			buf: UnsafeCell::new(Vec::with_capacity(size)),
 			cap: capacity,
+			size: size,
 			signal: Mutex::new(()),
 			wnotify: Condvar::new(),
 			rnotify: Condvar::new(),
@@ -40,17 +45,19 @@ impl RingBuffer {
 			tail: AtomicUsize::new(0),
 			rlock: Mutex::new(()),
 		};
+		unsafe {
+			(*rb.buf.get()).set_len(capacity);
+		} // Ensure raw buffer is allocated before this.
+		return rb;
 	}
 
 	pub fn wait_used(&self, amt: usize) -> usize {
-			let self_buf = unsafe{ &*self.buf.get() };
-			
 			loop  {
 				let tail = self.tail.load(Ordering::Relaxed);
 				let head = self.head.load(Ordering::Relaxed);
 				let used = match head >= tail {
 					true => (head - tail),
-					false => ((head + self_buf.len()) - tail),
+					false => ((head + self.size) - tail),
 				};
 
 				if used < amt {
@@ -64,14 +71,12 @@ impl RingBuffer {
 	}
 
 	pub fn wait_free(&self, amt: usize) -> usize {
-		let self_buf = unsafe{ &*self.buf.get() };
-		
 		loop  {
 			let tail = self.tail.load(Ordering::Relaxed);
 			let head = self.head.load(Ordering::Relaxed);
 			let free = self.cap - match head >= tail {
 				true => (head - tail),
-				false => ((head + self_buf.len()) - tail),
+				false => ((head + self.size) - tail),
 			};
 
 			if free < amt {
@@ -84,7 +89,7 @@ impl RingBuffer {
 			
 	}
 
-	pub fn read_full(&self, buf: &mut [u8]) -> Result<(), String> {
+	pub fn read_full(&self, buf: &mut Vec<T>) -> Result<(), String> {
 		if buf.len() == 0 {
 			return Ok(());
 		}
@@ -98,11 +103,10 @@ impl RingBuffer {
 			let used = self.wait_used(min(BLOCK_SIZE,to_read));
 
 			let self_buf = unsafe{ &*self.buf.get() };
-			let buf_len = self_buf.len();
 
 			let readable = min(used, to_read-have_read);
 			for i in 0..readable {
-				buf[have_read+i] = self_buf[(tail+i)%buf_len];
+				buf.push(self_buf[(tail+i)%self.size].clone());
 			}
 			have_read += readable;
 
@@ -115,7 +119,7 @@ impl RingBuffer {
 		return Ok(());
 	}
 
-	pub fn write_full(&self, buf: &[u8]) -> Result<(), String> {
+	pub fn write_full(&self, buf: &[T]) -> Result<(), String> {
 		if buf.len() == 0 {
 			return Ok(());
 		}
@@ -130,15 +134,17 @@ impl RingBuffer {
 			let free = self.wait_free(min(BLOCK_SIZE, to_write));
 
 			let self_buf = unsafe{ &mut *self.buf.get() };
-			let buf_len = self_buf.len();
 
 			let writable = min(free, to_write-have_write);
+			println!("Trying to write {}", writable);
 			for i in 0..writable {
-				 self_buf[(head+i)%buf_len] = buf[have_write+i];
+				 self_buf[(head+i)%self.size] = buf[have_write+i].clone();
 			}
+			println!("Successfully wrote {}", writable);
+
 			have_write += writable;
 
-			head = (head + writable) % buf_len;
+			head = (head + writable) % self.size;
 			self.head.store(head, Ordering::Release);
 			self.rnotify.notify_one();
 		}
@@ -151,32 +157,38 @@ impl RingBuffer {
 
 
 fn main() {
-	let ring = Arc::new(RingBuffer::new(2*1024*1024));
+	let ring = Arc::new(RingBuffer::<Arc<[u8; 1024*1024]>>::new(10));
 	let mut threads = Vec::new();
 	
 	let start = std::time::Instant::now();
-	for j in 0..10 {
+	for j in 0..1 {
 		let r = ring.clone();
 		let g = thread::spawn(move || {
 			for i in 0..100usize {
-				let write_me = [j*2+(i%2) as u8; 1024*1024];
-				r.write_full(&write_me).unwrap();
+				println!("About to prep data for {}:{}", j,i);
+				let write_me = vec![Arc::new([j*2+(i%2) as u8; 1024*1024])];
+				println!("writable size: {}", write_me.len());
+				r.write_full(write_me.as_slice()).unwrap();
 
 			}
 		});
 		threads.push(g);
 	}
 
-	// std::thread::sleep(std::time::Duration::from_millis(4000));
+	std::thread::sleep(std::time::Duration::from_millis(4000));
 	for _ in 0..10 {
 		let r = ring.clone();
 		let g = thread::spawn(move || {
 			for _ in 0..100usize {
-				let mut read_data = [0; 1024*1024];
+				let mut read_data = vec![];
+				println!("Reading~");
 				r.read_full(&mut read_data).unwrap();
-				for x in read_data.iter() {
-					assert!(*x == read_data[0]);
+				for v in read_data.iter() {
+					for x in v.iter() {
+						assert!(*x == (*read_data[0])[0]);
+					}
 				}
+				
 			}
 		});
 		threads.push(g);
