@@ -1,4 +1,3 @@
-
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
@@ -40,7 +39,7 @@ where T: Clone {
 			wlock: Mutex::new(()),
 			tail: AtomicUsize::new(0),
 			rlock: Mutex::new(()),
-		};
+		}
 
 	}
 
@@ -67,6 +66,7 @@ where T: Clone {
 			true => (head - tail),
 			false => ((head + self.buf_size()) - tail),
 		}
+
 	}
 
 	#[inline]
@@ -147,10 +147,10 @@ where T: Clone {
 			self.head.store(head, Ordering::Release);
 		}
 
-
 		drop(wlock);
 		return Ok(());
 	}
+
 }
 
 #[cfg(test)]
