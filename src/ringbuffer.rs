@@ -99,11 +99,12 @@ where T: Clone {
 
 	}
 
-	pub fn read_full(&self, buf: &mut Vec<T>, amt: usize) -> Result<(), String> {
+	pub fn read_full(&self, amt: usize) -> Result<Vec<T>, String> {
 		let rlock = self.rlock.lock().unwrap();
 
 		let to_read = amt;
 		let mut have_read = 0;
+		let mut ret = Vec::with_capacity(amt);
 
 		let mut tail = self.tail.load(Ordering::Acquire);
 		while have_read < to_read {
@@ -111,7 +112,7 @@ where T: Clone {
 
 			let readable = min(used, to_read-have_read);
 			for i in 0..readable {
-				unsafe{ buf.push(self.buf_read((tail+i)%self.buf_size())); }
+				unsafe{ ret.push(self.buf_read((tail+i)%self.buf_size())); }
 			}
 			have_read += readable;
 
@@ -120,7 +121,7 @@ where T: Clone {
 		}
 
 		drop(rlock);
-		return Ok(());
+		return Ok(ret);
 	}
 
 	pub fn write_full(&self, buf: &[T]) -> Result<(), String> {
@@ -190,8 +191,7 @@ mod tests {
 			let r = ring.clone();
 			let g = thread::spawn(move || {
 				for _ in 0..NUM_WRITES {
-					let mut read_data = Vec::with_capacity(PIECES_PER_WRITE);
-					r.read_full(&mut read_data, PIECES_PER_WRITE).unwrap();
+					let read_data =	r.read_full(PIECES_PER_WRITE).unwrap();
 
 					for v in 0..read_data.len() {
 						if v > 0 {
