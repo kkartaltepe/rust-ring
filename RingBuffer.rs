@@ -1,8 +1,9 @@
 extern crate core;
 
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, Mutex};
 use std::result::Result;
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::cmp::{min};
 use std::thread;
@@ -50,12 +51,9 @@ struct RingBuffer<T> {
 	size: usize, // size of the underlying buffer
 	cap: usize,
 
-	head: Mutex<usize>,
-	tail: Mutex<usize>,
-
-	wnotify: Condvar,
-	rnotify: Condvar,
+	head: AtomicUsize,
 	rlock: Mutex<()>,
+	tail: AtomicUsize,
 	wlock: Mutex<()>,
 
 }
@@ -74,29 +72,26 @@ where T: Clone {
 			buf: UnsafeCell::new(RawBuf::new(size)),
 			cap: capacity,
 			size: size,
-			
-			head: Mutex::new(0),
-			tail: Mutex::new(0),
 
+			head: AtomicUsize::new(0),
 			wlock: Mutex::new(()),
+			tail: AtomicUsize::new(0),
 			rlock: Mutex::new(()),
-			wnotify: Condvar::new(),
-			rnotify: Condvar::new(),
 		};
 	}
 
-	fn wait_used(&self, amt: usize) -> usize {
+	pub fn wait_used(&self, amt: usize) -> usize {
 			loop  {
-				let tail = self.tail.lock().unwrap();
-				let head = self.head.lock().unwrap();
-				let used = match *head >= *tail {
-					true => (*head - *tail),
-					false => ((*head + self.size) - *tail),
+				let tail = self.tail.load(Ordering::Relaxed);
+				let head = self.head.load(Ordering::Relaxed);
+				let used = match head >= tail {
+					true => (head - tail),
+					false => ((head + self.size) - tail),
 				};
 
 				if used < amt {
-					drop(tail);
-					drop(self.rnotify.wait(head).unwrap());
+					std::thread::yield_now();
+					// drop(self.rnotify.wait(self.signal.lock().unwrap()).unwrap());
 				} else {
 					return used;
 				}
@@ -105,18 +100,18 @@ where T: Clone {
 
 	}
 
-	fn wait_free(&self, amt: usize) -> usize {
+	pub fn wait_free(&self, amt: usize) -> usize {
 		loop  {
-			let tail = self.tail.lock().unwrap();
-			let head = self.head.lock().unwrap();
-			let free = self.cap - match *head >= *tail {
-				true => (*head - *tail),
-				false => ((*head + self.size) - *tail),
+			let tail = self.tail.load(Ordering::Relaxed);
+			let head = self.head.load(Ordering::Relaxed);
+			let free = self.cap - match head >= tail {
+				true => (head - tail),
+				false => ((head + self.size) - tail),
 			};
 
 			if free < amt {
-				drop(head);
-				drop(self.wnotify.wait(tail).unwrap());
+				std::thread::yield_now();
+				// drop(self.wnotify.wait(self.signal.lock().unwrap()).unwrap());
 			} else {
 				return free;
 			}
@@ -142,7 +137,7 @@ where T: Clone {
 		let to_read = amt;
 		let mut have_read = 0;
 
-		let mut tail = *self.tail.lock().unwrap();
+		let mut tail = self.tail.load(Ordering::Acquire);
 		while have_read < to_read {
 			let used = self.wait_used(min(BLOCK_SIZE,to_read-have_read));
 
@@ -154,10 +149,8 @@ where T: Clone {
 			have_read += readable;
 
 			tail = (tail + readable) % self.size;
-			let mut _tail = self.tail.lock().unwrap();
-			*_tail = tail;
-			drop(_tail);
-			self.wnotify.notify_one();
+			self.tail.store(tail, Ordering::Release);
+			// self.wnotify.notify_one();
 		}
 
 		drop(rlock);
@@ -173,7 +166,7 @@ where T: Clone {
 		let to_write = buf.len();
 		let mut have_write = 0;
 
-		let mut head = *(self.head.lock().unwrap());
+		let mut head = self.head.load(Ordering::Acquire);
 
 		while have_write < to_write {
 			let free = self.wait_free(min(BLOCK_SIZE, to_write-have_write));
@@ -186,10 +179,8 @@ where T: Clone {
 			have_write += writable;
 
 			head = (head + writable) % self.size;
-			let mut _head = self.head.lock().unwrap();
-			*_head = head;
-			drop(_head);
-			self.rnotify.notify_one();
+			self.head.store(head, Ordering::Release);
+			// self.rnotify.notify_one();
 		}
 
 
