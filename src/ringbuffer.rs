@@ -124,6 +124,38 @@ where T: Clone {
 		return Ok(ret);
 	}
 
+	pub fn read(&self, amt: usize) -> Result<Vec<T>, String> {
+		let mut ret = Vec::new();
+		let rlock = match self.rlock.try_lock() {
+			Err(_) => return Ok(ret),
+			g => g,
+		};
+
+		let to_read = amt;
+		let mut have_read = 0;
+
+		let mut tail = self.tail.load(Ordering::Acquire);
+		while have_read < to_read {
+			let used = self.used();
+			if used == 0 {
+				break;
+			}
+			// let used = self.wait_used(min(BLOCK_SIZE,to_read-have_read));
+
+			let readable = min(used, to_read-have_read);
+			for i in 0..readable {
+				unsafe{ ret.push(self.buf_read((tail+i)%self.buf_size())); }
+			}
+			have_read += readable;
+
+			tail = (tail + readable) % self.buf_size();
+			self.tail.store(tail, Ordering::Release);
+		}
+
+		drop(rlock);
+		return Ok(ret);
+	}
+
 	pub fn write_full(&self, buf: &[T]) -> Result<(), String> {
 		if buf.len() == 0 {
 			return Ok(());
